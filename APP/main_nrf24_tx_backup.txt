@@ -1,0 +1,280 @@
+/*
+ * main_nrf24_tx_backup.txt
+ * STM32F401RC NRF24L01 Transmitter Firmware
+ * 
+ * Board 2 - TRANSMITTER:
+ * Sends "hello : {num}" message every 1 second with incrementing counter (0, 1, 2, 3...)
+ * Uses NRF24L01 wireless module on channel 76
+ * No LCD display required
+ * 
+ * Hardware Configuration:
+ * ========================
+ * STM32F401RC Microcontroller:
+ *  - SPI1: PA5(SCK), PA6(MISO), PA7(MOSI)
+ *  - NRF24L01 Control: PA2(IRQ), PA3(CSN), PA4(CE)
+ *  - Crystal: 16 MHz (built-in)
+ * 
+ * NRF24L01 Wireless Module:
+ *  - PA5  -> CLK (clock)
+ *  - PA6  -> MISO (data in)
+ *  - PA7  -> MOSI (data out)
+ *  - PA3  -> CSN (chip select, active low)
+ *  - PA4  -> CE (chip enable)
+ *  - PA2  -> IRQ (interrupt, active low)
+ *  - GND  -> GND
+ *  - 3.3V -> VCC (with 10µF decoupling capacitor)
+ * 
+ * Transmission Behavior:
+ * ========================
+ * 1. Initializes SPI1 and NRF24L01 in TX mode
+ * 2. Builds 32-byte messages: "hello : {num}" where {num} = 0, 1, 2, 3...
+ * 3. Transmits via HAL_NRF24_TransmitPayload()
+ * 4. Waits 1 second between transmissions (1000ms delay)
+ * 5. Increments counter indefinitely
+ * 
+ * Example messages:
+ *  - "hello : 0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" (counter=0)
+ *  - "hello : 1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" (counter=1)
+ *  - "hello : 123\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" (counter=123)
+ * 
+ * Code Structure:
+ * ========================
+ * APP_IntToString()       - Converts uint32 counter to null-terminated ASCII string
+ * APP_SPI1_GPIOInit()     - Configures PA5-PA7 for SPI1 (SCK, MISO, MOSI)
+ * APP_InitPeripherals()   - Powers clocks, initializes SPI1 and NRF24L01
+ * APP_Run()               - Main TX loop: build message -> transmit -> delay -> increment
+ * main()                  - Calls APP_Run()
+ * 
+ * Integration Notes:
+ * ========================
+ * This transmitter pairs with main_nrf24_rx_backup.txt (Board 1)
+ * Both use the same NRF24L01 driver (HAL_NRF24L01.c/h)
+ * Both operate on channel 76 with 32-byte payload and 5-byte address width
+ * Receiver displays messages on 16x2 LCD; Transmitter sends only
+ * 
+ * Flashing Instructions:
+ * ========================
+ * 1. Build: cmake --build build/Release
+ * 2. Flash: STM32CubeProgrammer v2.19.0 with SWD interface to second board
+ * 3. Verify: Check if messages are being transmitted (observed on receiver LCD)
+ * 
+ * Generated: Compiled with ARM GCC v13.3.1
+ * Binary Size: ~2.5 KB (FLASH), ~2 KB (RAM)
+ * Target: STM32F401xB/C (Rev Z)
+ */
+
+#include "app.h"
+#include "HAL_NRF24L01.h"
+#include "MCAL_RCC.h"
+#include "MCAL_SPI.h"
+
+enum
+{
+    APP_DELAY_LOOPS_PER_MS = 4000UL,
+    APP_NRF24_CHANNEL = 76U,
+    APP_NRF24_PAYLOAD_WIDTH = 32U
+};
+
+static hal_nrf24_t g_app_nrf24;
+
+static const hal_nrf24_config_t g_app_nrf24_config = {
+    .spi_port = SPI1,
+    .ce_pin = {GPIOA, MCAL_GPIO_PIN_4},
+    .csn_pin = {GPIOA, MCAL_GPIO_PIN_3},
+    .irq_pin = {GPIOA, MCAL_GPIO_PIN_2},
+    .channel = APP_NRF24_CHANNEL,
+    .payload_width = APP_NRF24_PAYLOAD_WIDTH,
+    .address_width = 5U,
+    .power_level = 0U,
+    .data_rate = 0U
+};
+
+static void APP_DelayCycles(volatile uint32 cycles);
+static void APP_DelayMs(uint32 milliseconds);
+static void APP_GPIO_SetAlternateFunction(GPIO_RegDef_t *gpio_port,
+                                          mcal_gpio_pin_t pin,
+                                          uint8 alternate_function);
+static void APP_SPI1_GPIOInit(void);
+static uint8 APP_InitPeripherals(void);
+static void APP_IntToString(uint32 value, uint8 *buffer);
+
+static void APP_DelayCycles(volatile uint32 cycles)
+{
+    while (cycles > 0U)
+    {
+        __asm volatile ("nop");
+        cycles--;
+    }
+}
+
+static void APP_DelayMs(uint32 milliseconds)
+{
+    while (milliseconds > 0U)
+    {
+        APP_DelayCycles(APP_DELAY_LOOPS_PER_MS);
+        milliseconds--;
+    }
+}
+
+static void APP_GPIO_SetAlternateFunction(GPIO_RegDef_t *gpio_port,
+                                          mcal_gpio_pin_t pin,
+                                          uint8 alternate_function)
+{
+    uint32 shift;
+
+    if ((gpio_port == NULL) || (pin > MCAL_GPIO_PIN_15) || (alternate_function > 15U))
+    {
+        return;
+    }
+
+    if (pin < MCAL_GPIO_PIN_8)
+    {
+        shift = (uint32)pin * 4U;
+        gpio_port->AFRL &= ~(0xFUL << shift);
+        gpio_port->AFRL |= ((uint32)alternate_function << shift);
+    }
+    else
+    {
+        shift = ((uint32)pin - 8U) * 4U;
+        gpio_port->AFRH &= ~(0xFUL << shift);
+        gpio_port->AFRH |= ((uint32)alternate_function << shift);
+    }
+}
+
+static void APP_IntToString(uint32 value, uint8 *buffer)
+{
+    uint8 temp[10];
+    uint8 index = 0U;
+    uint8 output_index = 0U;
+
+    if (buffer == NULL)
+    {
+        return;
+    }
+
+    if (value == 0U)
+    {
+        buffer[0] = (uint8)'0';
+        buffer[1] = (uint8)'\0';
+        return;
+    }
+
+    while ((value > 0U) && (index < 10U))
+    {
+        temp[index] = (uint8)('0' + (value % 10U));
+        value /= 10U;
+        index++;
+    }
+
+    while (index > 0U)
+    {
+        index--;
+        buffer[output_index] = temp[index];
+        output_index++;
+    }
+
+    buffer[output_index] = (uint8)'\0';
+}
+
+static void APP_SPI1_GPIOInit(void)
+{
+    MCAL_GPIO_Init(GPIOA,
+                   MCAL_GPIO_PIN_5,
+                   MCAL_GPIO_MODE_AF_PP,
+                   MCAL_GPIO_SPEED_VERY_HIGH);
+
+    MCAL_GPIO_Init(GPIOA,
+                   MCAL_GPIO_PIN_6,
+                   MCAL_GPIO_MODE_AF_PP_PULLUP,
+                   MCAL_GPIO_SPEED_VERY_HIGH);
+
+    MCAL_GPIO_Init(GPIOA,
+                   MCAL_GPIO_PIN_7,
+                   MCAL_GPIO_MODE_AF_PP,
+                   MCAL_GPIO_SPEED_VERY_HIGH);
+
+    APP_GPIO_SetAlternateFunction(GPIOA, MCAL_GPIO_PIN_5, 5U);
+    APP_GPIO_SetAlternateFunction(GPIOA, MCAL_GPIO_PIN_6, 5U);
+    APP_GPIO_SetAlternateFunction(GPIOA, MCAL_GPIO_PIN_7, 5U);
+}
+
+static uint8 APP_InitPeripherals(void)
+{
+    hal_nrf24_status_t nrf24_status;
+
+    MCAL_RCC_EnableGPIOClock(MCAL_RCC_GPIO_PORT_A);
+    MCAL_RCC_EnableGPIOClock(MCAL_RCC_GPIO_PORT_B);
+    MCAL_RCC_EnableAPB2PeripheralClock(MCAL_RCC_APB2_SPI1);
+
+    APP_SPI1_GPIOInit();
+
+    nrf24_status = HAL_NRF24_Init(&g_app_nrf24, &g_app_nrf24_config);
+    if (nrf24_status != HAL_NRF24_STATUS_OK)
+    {
+        return 0U;
+    }
+
+    HAL_NRF24_PowerUp(&g_app_nrf24);
+    HAL_NRF24_SetTXMode(&g_app_nrf24);
+    APP_DelayMs(100U);
+
+    return 1U;
+}
+
+void APP_Run(void)
+{
+    uint8 tx_data[32];
+    uint8 index;
+    uint8 num_str[10];
+    uint32 counter;
+
+    if (APP_InitPeripherals() == 0U)
+    {
+        while (1)
+        {
+        }
+    }
+
+    counter = 0U;
+
+    while (1)
+    {
+        /* Build message: "hello : {num}" */
+        index = 0U;
+
+        tx_data[index++] = (uint8)'h';
+        tx_data[index++] = (uint8)'e';
+        tx_data[index++] = (uint8)'l';
+        tx_data[index++] = (uint8)'l';
+        tx_data[index++] = (uint8)'o';
+        tx_data[index++] = (uint8)' ';
+        tx_data[index++] = (uint8)':';
+        tx_data[index++] = (uint8)' ';
+
+        APP_IntToString(counter, num_str);
+
+        while ((num_str[index - 8U] != (uint8)'\0') && (index < 32U))
+        {
+            tx_data[index] = num_str[index - 8U];
+            index++;
+        }
+
+        while (index < 32U)
+        {
+            tx_data[index] = (uint8)'\0';
+            index++;
+        }
+
+        HAL_NRF24_TransmitPayload(&g_app_nrf24, tx_data, 32U);
+
+        APP_DelayMs(1000U);
+
+        counter++;
+    }
+}
+
+int main(void)
+{
+    APP_Run();
+    return 0;
+}
