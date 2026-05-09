@@ -1,0 +1,246 @@
+/*
+ * main_nrf24_rx_backup.txt
+ * STM32F401RC NRF24L01 Receiver Firmware
+ *
+ * Board 1 - RECEIVER:
+ * Receives 32-byte sentences from NRF24L01 on channel 76 and displays them on 16x2 LCD.
+ */
+
+#include "app.h"
+#include "HAL_LCD.h"
+#include "HAL_NRF24L01.h"
+#include "MCAL_RCC.h"
+#include "MCAL_USART.h"
+#include "MCAL_SPI.h"
+
+enum
+{
+    APP_DELAY_LOOPS_PER_MS = 4000UL,
+    APP_LCD_CHARS_PER_LINE = 16U,
+    APP_NRF24_CHANNEL = 76U,
+    APP_NRF24_PAYLOAD_WIDTH = 32U
+};
+
+static hal_lcd_t g_app_lcd = {
+    .interface_mode = HAL_LCD_INTERFACE_4BIT,
+    .lines_mode = HAL_LCD_LINES_2,
+    .font_mode = HAL_LCD_FONT_5X8,
+    .gpio_speed = MCAL_GPIO_SPEED_LOW,
+    .rows = 2U,
+    .columns = 16U,
+    .rs_pin = {GPIOB, MCAL_GPIO_PIN_14},
+    .en_pin = {GPIOB, MCAL_GPIO_PIN_12},
+    .rw_pin_used = 0U,
+    .rw_pin = {NULL, MCAL_GPIO_PIN_0},
+    .data_pins = {
+        {NULL, MCAL_GPIO_PIN_0},
+        {NULL, MCAL_GPIO_PIN_0},
+        {NULL, MCAL_GPIO_PIN_0},
+        {NULL, MCAL_GPIO_PIN_0},
+        {GPIOB, MCAL_GPIO_PIN_4},
+        {GPIOB, MCAL_GPIO_PIN_3},
+        {GPIOB, MCAL_GPIO_PIN_5},
+        {GPIOB, MCAL_GPIO_PIN_7}
+    },
+    .backlight_pin_used = 0U,
+    .backlight_pin = {NULL, MCAL_GPIO_PIN_0},
+    .display_control = 0U,
+    .entry_mode = 0U,
+    .function_set = 0U
+};
+
+static hal_nrf24_t g_app_nrf24;
+
+static const mcal_spi_config_t g_app_spi1_config = {
+    .device_mode = MCAL_SPI_DEVICE_MASTER,
+    .bus_config = MCAL_SPI_BUS_FULL_DUPLEX,
+    .data_frame = MCAL_SPI_DFF_8BIT,
+    .clock_polarity = MCAL_SPI_CPOL_LOW,
+    .clock_phase = MCAL_SPI_CPHA_FIRST_EDGE,
+    .baud_prescaler = MCAL_SPI_BAUD_DIV16,
+    .first_bit = MCAL_SPI_FIRSTBIT_MSB,
+    .software_slave_management = MCAL_SPI_SSM_ENABLE,
+    .nss_mode = MCAL_SPI_NSS_SOFTWARE_INTERNAL,
+    .crc_calculation = MCAL_SPI_CRC_DISABLE,
+    .ti_mode = MCAL_SPI_TI_MODE_DISABLE,
+    .dma_rx = MCAL_SPI_DMA_RX_DISABLE,
+    .dma_tx = MCAL_SPI_DMA_TX_DISABLE
+};
+
+static const hal_nrf24_config_t g_app_nrf24_config = {
+    .spi_port = SPI1,
+    .ce_pin = {GPIOA, MCAL_GPIO_PIN_4},
+    .csn_pin = {GPIOA, MCAL_GPIO_PIN_3},
+    .irq_pin = {GPIOA, MCAL_GPIO_PIN_2},
+    .channel = APP_NRF24_CHANNEL,
+    .payload_width = APP_NRF24_PAYLOAD_WIDTH,
+    .address_width = 5U,
+    .power_level = 0U,
+    .data_rate = 0U
+};
+
+static void APP_DelayCycles(volatile uint32 cycles);
+static void APP_DelayMs(uint32 milliseconds);
+static void APP_GPIO_SetAlternateFunction(GPIO_RegDef_t *gpio_port,
+                                          mcal_gpio_pin_t pin,
+                                          uint8 alternate_function);
+static void APP_UART2_GPIOInit(void);
+static void APP_SPI1_GPIOInit(void);
+static uint8 APP_InitPeripherals(void);
+
+static void APP_DelayCycles(volatile uint32 cycles)
+{
+    while (cycles > 0U)
+    {
+        __asm volatile ("nop");
+        cycles--;
+    }
+}
+
+static void APP_DelayMs(uint32 milliseconds)
+{
+    while (milliseconds > 0U)
+    {
+        APP_DelayCycles(APP_DELAY_LOOPS_PER_MS);
+        milliseconds--;
+    }
+}
+
+static void APP_GPIO_SetAlternateFunction(GPIO_RegDef_t *gpio_port,
+                                          mcal_gpio_pin_t pin,
+                                          uint8 alternate_function)
+{
+    uint32 shift;
+
+    if ((gpio_port == NULL) || (pin > MCAL_GPIO_PIN_15) || (alternate_function > 15U))
+    {
+        return;
+    }
+
+    if (pin < MCAL_GPIO_PIN_8)
+    {
+        shift = (uint32)pin * 4U;
+        gpio_port->AFRL &= ~(0xFUL << shift);
+        gpio_port->AFRL |= ((uint32)alternate_function << shift);
+    }
+    else
+    {
+        shift = ((uint32)pin - 8U) * 4U;
+        gpio_port->AFRH &= ~(0xFUL << shift);
+        gpio_port->AFRH |= ((uint32)alternate_function << shift);
+    }
+}
+
+static void APP_UART2_GPIOInit(void)
+{
+    MCAL_GPIO_Init(GPIOA, MCAL_GPIO_PIN_2, MCAL_GPIO_MODE_AF_PP, MCAL_GPIO_SPEED_VERY_HIGH);
+    MCAL_GPIO_Init(GPIOA, MCAL_GPIO_PIN_3, MCAL_GPIO_MODE_AF_PP_PULLUP, MCAL_GPIO_SPEED_VERY_HIGH);
+    APP_GPIO_SetAlternateFunction(GPIOA, MCAL_GPIO_PIN_2, 7U);
+    APP_GPIO_SetAlternateFunction(GPIOA, MCAL_GPIO_PIN_3, 7U);
+}
+
+static void APP_SPI1_GPIOInit(void)
+{
+    MCAL_GPIO_Init(GPIOA, MCAL_GPIO_PIN_5, MCAL_GPIO_MODE_AF_PP, MCAL_GPIO_SPEED_VERY_HIGH);
+    MCAL_GPIO_Init(GPIOA, MCAL_GPIO_PIN_6, MCAL_GPIO_MODE_AF_PP_PULLUP, MCAL_GPIO_SPEED_VERY_HIGH);
+    MCAL_GPIO_Init(GPIOA, MCAL_GPIO_PIN_7, MCAL_GPIO_MODE_AF_PP, MCAL_GPIO_SPEED_VERY_HIGH);
+    APP_GPIO_SetAlternateFunction(GPIOA, MCAL_GPIO_PIN_5, 5U);
+    APP_GPIO_SetAlternateFunction(GPIOA, MCAL_GPIO_PIN_6, 5U);
+    APP_GPIO_SetAlternateFunction(GPIOA, MCAL_GPIO_PIN_7, 5U);
+}
+
+static uint8 APP_InitPeripherals(void)
+{
+    hal_nrf24_status_t nrf24_status;
+    mcal_spi_status_t spi_status;
+
+    MCAL_RCC_EnableGPIOClock(MCAL_RCC_GPIO_PORT_A);
+    MCAL_RCC_EnableGPIOClock(MCAL_RCC_GPIO_PORT_B);
+    MCAL_RCC_EnableAPB1PeripheralClock(MCAL_RCC_APB1_USART2);
+    MCAL_RCC_EnableAPB2PeripheralClock(MCAL_RCC_APB2_SPI1);
+
+    APP_UART2_GPIOInit();
+    APP_SPI1_GPIOInit();
+    HAL_LCD_Init(&g_app_lcd);
+
+    spi_status = MCAL_SPI_Init(SPI1, &g_app_spi1_config);
+    if (spi_status != MCAL_SPI_STATUS_OK)
+    {
+        HAL_LCD_Clear(&g_app_lcd);
+        HAL_LCD_WriteString(&g_app_lcd, (const uint8 *)"SPI1 Init Err");
+        return 0U;
+    }
+
+    MCAL_SPI_Enable(SPI1);
+
+    nrf24_status = HAL_NRF24_Init(&g_app_nrf24, &g_app_nrf24_config);
+    if (nrf24_status != HAL_NRF24_STATUS_OK)
+    {
+        HAL_LCD_Clear(&g_app_lcd);
+        HAL_LCD_WriteString(&g_app_lcd, (const uint8 *)"NRF24 Init Err");
+        return 0U;
+    }
+
+    HAL_LCD_Clear(&g_app_lcd);
+    HAL_LCD_WriteString(&g_app_lcd, (const uint8 *)"NRF24 Ready");
+    APP_DelayMs(1000U);
+    return 1U;
+}
+
+void APP_Run(void)
+{
+    uint8 rx_data[32];
+    uint8 rx_len;
+    uint8 index;
+    hal_nrf24_status_t status;
+
+    if (APP_InitPeripherals() == 0U)
+    {
+        while (1) {}
+    }
+
+    HAL_NRF24_PowerUp(&g_app_nrf24);
+    HAL_NRF24_SetRXMode(&g_app_nrf24);
+    APP_DelayMs(100U);
+
+    HAL_LCD_Clear(&g_app_lcd);
+    HAL_LCD_SetCursor(&g_app_lcd, 0U, 0U);
+    HAL_LCD_WriteString(&g_app_lcd, (const uint8 *)"Waiting...");
+
+    while (1)
+    {
+        status = HAL_NRF24_ReceivePayload(&g_app_nrf24, rx_data, &rx_len);
+        if ((status == HAL_NRF24_STATUS_OK) && (rx_len > 0U))
+        {
+            HAL_LCD_Clear(&g_app_lcd);
+            HAL_LCD_SetCursor(&g_app_lcd, 0U, 0U);
+            index = 0U;
+            while ((index < rx_len) && (index < APP_LCD_CHARS_PER_LINE) && (rx_data[index] != (uint8)'\0'))
+            {
+                HAL_LCD_WriteChar(&g_app_lcd, rx_data[index]);
+                index++;
+            }
+            if ((rx_len > APP_LCD_CHARS_PER_LINE) && (g_app_lcd.rows > 1U))
+            {
+                HAL_LCD_SetCursor(&g_app_lcd, 1U, 0U);
+                while ((index < rx_len) && (index < APP_NRF24_PAYLOAD_WIDTH) && (rx_data[index] != (uint8)'\0'))
+                {
+                    HAL_LCD_WriteChar(&g_app_lcd, rx_data[index]);
+                    index++;
+                }
+            }
+            APP_DelayMs(2000U);
+            HAL_LCD_Clear(&g_app_lcd);
+            HAL_LCD_SetCursor(&g_app_lcd, 0U, 0U);
+            HAL_LCD_WriteString(&g_app_lcd, (const uint8 *)"Waiting...");
+        }
+
+        APP_DelayMs(100U);
+    }
+}
+
+int main(void)
+{
+    APP_Run();
+    return 0;
+}
